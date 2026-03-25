@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+
+import rospy
+import math
+from clover import srv
+from std_srvs.srv import Trigger
+from clover_yolo.msg import DetectionArray
+from sensor_msgs.msg import Range
+
+
+class MissionController:
+    def __init__(self):
+        rospy.init_node('mission_controller', anonymous=True)
+
+        # Сервисы Clover
+        rospy.wait_for_service('get_telemetry')
+        rospy.wait_for_service('navigate')
+        rospy.wait_for_service('land')
+
+        self.get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+        self.land = rospy.ServiceProxy('land', Trigger)
+
+        # Подписки
+        self.detections_sub = rospy.Subscriber('/vision/detections', DetectionArray, self.detections_callback)
+        self.range_sub = rospy.Subscriber('/front_rangefinder/range', Range, self.range_callback)
+
+        # Состояние
+        self.current_range = 0.0
+        self.state = 'WAIT_START'
+        self.locked_target_id = -1
+        self.start_time = rospy.Time.now()
+
+        # Настройки
+        self.target_dist = 1.5  # Дистанция до человека
+        self.target_altitude = 1.8  # Высота полета
+        self.safe_dist = 0.8  # Дистанция до препятствия (дерева)
+        self.center_offset = 0.47  # Коррекция сноса влево (чуть меньше 0.5)
+
+    def range_callback(self, msg):
+        self.current_range = msg.range
+
+    def navigate_wait(self, x=0, y=0, z=0, yaw=float('nan'), speed=0.5, frame_id='body', auto_arm=False,
+                      tolerance=0.15):
+        self.navigate(x=x, y=y, z=z, yaw=yaw, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
+        rospy.sleep(0.5)
+        while not rospy.is_shutdown():
+            telem = self.get_telemetry(frame_id='body')
+            if math.hypot(telem.x, telem.y) < tolerance:
+                break
+            rospy.sleep(0.1)
+
+    def detections_callback(self, msg):
+        if self.state == 'WAIT_START':
+            return
+
+        target = None
+        obstacle_danger = False
+
+        # 1. Проверка препятствий (режим AVOID)
+        for det in msg.detections:
+            if det.class_name.lower() == 'obstacle' and self.current_range < self.safe_dist:
+                obstacle_danger = True
+
+        # 2. Поиск целевого человека
+        for det in msg.detections:
+            if det.class_name.lower() == 'target_person':
+                if self.locked_target_id == -1:
+                    self.locked_target_id = det.target_id
+                    rospy.loginfo(f"🎯 ЦЕЛЬ ЗАХВАЧЕНА! ID: {self.locked_target_id}")
+
+                if det.target_id == self.locked_target_id:
+                    target = det
+                    break
+
+        # === АВТОМАТ СОСТОЯНИЙ ===
+
+        if obstacle_danger:
+            self.state = 'AVOID'
+            rospy.logwarn_throttle(2, "⚠️ ПРЕПЯТСТВИЕ! Остановка.")
+            self.navigate(x=0, y=0, z=0, frame_id='body')
+            return
+
+        if target:
+            self.state = 'TRACK'
+            cx = (target.x_min + target.x_max) / 2.0
+            error_y = self.center_offset - cx
+            error_x = self.current_range - self.target_dist
+
+            # Мертвая зона
+            if abs(error_y) < 0.05: error_y = 0
+            if abs(error_x) < 0.1:  error_x = 0
+
+            vx = max(min(error_x * 0.7, 0.45), -0.45)
+            vy = max(min(error_y * 0.9, 0.4), -0.4)
+
+            self.navigate(x=vx, y=vy, z=0, frame_id='body', speed=0.5)
+            rospy.loginfo_throttle(2, f"▶ TRACK [ID: {self.locked_target_id}] | Dist: {self.current_range:.2f}м")
+        else:
+            self.state = 'SEARCH'
+            # Если потеряли - просто висим или медленно вращаемся
+            self.navigate(x=0, y=0, z=0, yaw=0.2, frame_id='body')
+            rospy.loginfo_throttle(5, "🔍 Поиск цели...")
+
+    def run_mission(self):
+        rospy.loginfo("Взлет...")
+        self.navigate_wait(z=self.target_altitude, frame_id='body', auto_arm=True)
+
+        rospy.loginfo("Маневр от сетки (вправо)...")
+        self.navigate_wait(x=0, y=-1.0, z=0, frame_id='body')
+
+        rospy.loginfo("Запуск логики сопровождения")
+        self.state = 'SEARCH'
+
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            if rospy.Time.now() - self.start_time > rospy.Duration(180):
+                break
+            rate.sleep()
+
+        rospy.loginfo("Посадка")
+        self.land()
+
+
+if __name__ == '__main__':
+    try:
+        controller = MissionController()
+        controller.run_mission()
+    except rospy.ROSInterruptException:
+        pass
